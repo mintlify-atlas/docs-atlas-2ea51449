@@ -1,0 +1,64 @@
+{
+  "projectType": "api-service",
+  "projectName": "ROMP-GPS",
+  "projectDescription": "A Spring Boot TCP server that receives GT06 protocol GPS device data over TCP/Netty, decodes it, and forwards it to a backend via HTTP.",
+  "theme": "aspen",
+  "primaryColor": "#1E88E5",
+  "lightColor": "#42A5F5",
+  "darkColor": "#0D47A1",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Architecture",
+            "pages": ["architecture/overview", "architecture/gt06-protocol", "architecture/data-flow"]
+          },
+          {
+            "group": "Configuration",
+            "pages": ["configuration/application-properties", "configuration/deployment"]
+          },
+          {
+            "group": "Operations",
+            "pages": ["operations/docker", "operations/monitoring", "operations/troubleshooting"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "HTTP Endpoints",
+            "pages": ["api/overview", "api/receive-gps-data"]
+          },
+          {
+            "group": "TCP Protocol",
+            "pages": ["api/tcp-server", "api/gt06-messages"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "GT06 protocol TCP server using Netty for high-performance GPS device communication",
+    "IMEI-based device authentication with login ACK/NACK",
+    "Real-time GPS location decoding (latitude, longitude, speed, validity)",
+    "Heartbeat handling with ACC status tracking",
+    "HTTP forwarding of decoded GPS data to a configurable backend service",
+    "Dockerized deployment with Spring Boot on Java 17"
+  ],
+  "publicApiSurface": [
+    "POST /data/ubicacion — Receive a GPSData payload and forward to backend",
+    "TCP port 9000 — GT06 protocol: Login (0x01), Location (0x12), Heartbeat (0x13)",
+    "GT06Utils.decodificarIMEI(byte[]) — Decode BCD-encoded IMEI bytes",
+    "GT06Utils.calcularCRC(byte[]) — Compute CRC-16 checksum",
+    "GT06Utils.ACK(short serial) — Build GT06 login ACK response",
+    "GT06Utils.ACKHeartbeat(short serial) — Build GT06 heartbeat ACK response",
+    "SendHTTP.EnviaDatos(GPSData) — POST GPS data to backend URL"
+  ]
+}
