@@ -1,0 +1,189 @@
+---
+title: Monitoring
+description: Monitor ROMP-GPS using console logs and Spring Boot Actuator endpoints.
+---
+
+Romp-GPS surfaces operational state through two channels: **console logs** written by the Netty handlers and **Spring Boot Actuator** HTTP endpoints on port 8080.
+
+## Console log reference
+
+All key events are written to standard output by the Netty handler classes. When running in Docker, retrieve them with `docker logs -f romp-gps`.
+
+### Server startup
+
+```
+TCP GPS Server escuchando en puerto 9000
+```
+
+Printed by `ServerTcp.iniciarServidor()` once the Netty bootstrap has bound to port 9000. If this line does not appear, the TCP server did not start.
+
+### GPS device connected
+
+```
+GPS Conectado: /192.168.1.50:54321
+```
+
+Printed by `GpsServerHandler.channelActive()` when a GPS device opens a TCP connection. The value is the remote socket address (`host:port`).
+
+### GPS device disconnected
+
+```
+GPS desconectado
+```
+
+Printed by `GpsServerHandler.channelInactive()` when a device closes the connection or the TCP session is dropped.
+
+### Protocol byte received
+
+```
+Protocolo recibido: 01
+Protocolo recibido: 12
+Protocolo recibido: 13
+```
+
+Printed for every GT06 packet before it is dispatched to the appropriate handler. The hex value maps to packet type:
+
+| Hex | Packet type | Handler method |
+|-----|-------------|----------------|
+| `01` | Login (IMEI registration) | `login()` |
+| `12` | Location data | `ubicacion()` |
+| `13` | Heartbeat (status) | `heartbeat()` |
+
+### IMEI decoded
+
+```
+Serial recibido: 0001
+IMEI: 123456789012345
+ACK enviado: 78 78 05 01 00 01 D9 DC 0D 0A
+```
+
+Printed during login packet processing. The IMEI is decoded from 8 bytes of BCD-encoded data sent by the device. The ACK line shows the raw bytes sent back to the device to confirm login.
+
+### Location data
+
+```
+Fecha: 2024-06-15 14:32:07, Lat: 19.432600, Lon: -99.133200, Velocidad: 45 km/h, GPS valido: true
+```
+
+Printed when a `0x12` location packet is processed. Fields:
+
+| Field | Description |
+|-------|-------------|
+| `Fecha` | UTC timestamp from the device packet |
+| `Lat` / `Lon` | Decimal degrees. Negative values indicate South latitude or West longitude. |
+| `Velocidad` | Speed in km/h |
+| `GPS valido` | `true` if the GPS fix is valid (courseStatus bit 10 is set) |
+
+### Heartbeat
+
+```
+Heartbeat recibido
+Terminal info: 05
+Señal GSM: 24
+```
+
+Printed when a `0x13` heartbeat packet is processed.
+
+| Field | Description |
+|-------|-------------|
+| `Terminal info` | Raw hex byte from the device. Bit 2 (`0x04`) indicates ACC (ignition) on. |
+| `Señal GSM` | GSM signal level as an unsigned integer. Higher values indicate stronger signal. |
+
+The ACC state (`accOn`) is updated from this packet and included in subsequent location data sent to the backend.
+
+### Server error
+
+```
+El error del servidor es: io.netty.handler.codec.DecoderException: ...
+```
+
+Printed by `exceptionCaught()`. The channel is closed after the error.
+
+## Spring Boot Actuator
+
+Actuator is included as a dependency (`spring-boot-starter-actuator`) and is available on port 8080 once the server starts.
+
+<CardGroup cols={3}>
+  <Card title="/actuator/health" icon="heart-pulse">
+    Overall application health. Returns `{"status":"UP"}` when the server is running normally.
+  </Card>
+  <Card title="/actuator/info" icon="circle-info">
+    Application metadata. Populated from `spring.application.name` and any `info.*` properties.
+  </Card>
+  <Card title="/actuator/metrics" icon="chart-bar">
+    JVM and application metrics including memory usage, thread counts, and HTTP request statistics.
+  </Card>
+</CardGroup>
+
+### Health check
+
+```bash
+curl http://localhost:8080/actuator/health
+```
+
+Example response:
+
+```json
+{
+  "status": "UP"
+}
+```
+
+### Available metrics
+
+List all metric names:
+
+```bash
+curl http://localhost:8080/actuator/metrics
+```
+
+Query a specific metric (for example, JVM heap memory):
+
+```bash
+curl http://localhost:8080/actuator/metrics/jvm.memory.used
+```
+
+## Checking active GPS connections
+
+There is no dedicated REST endpoint for listing connected devices. Use log output to track connection state:
+
+1. Count `GPS Conectado` minus `GPS desconectado` lines to estimate active connections.
+2. Each connected channel prints its remote address, which you can correlate with IMEI from the subsequent login log line.
+
+<Tip>
+To retain connection history across restarts, redirect standard output to a log file or configure a logging appender. See the log level section below.
+</Tip>
+
+## Log level configuration
+
+Log verbosity is controlled via `application.properties`:
+
+```properties application.properties
+# Root log level
+logging.level.root=INFO
+
+# Netty handler package (increase for protocol debugging)
+logging.level.com.servidortpc=DEBUG
+
+# Suppress verbose Spring framework output
+logging.level.org.springframework=WARN
+```
+
+| Level | When to use |
+|-------|-------------|
+| `ERROR` | Production — only failures |
+| `WARN` | Production — failures and recoverable issues |
+| `INFO` | Default — startup, connections, location data |
+| `DEBUG` | Development — detailed packet processing |
+
+<Note>
+The application currently uses `System.out.println` for GPS event output rather than SLF4J loggers. These lines are always printed regardless of the configured log level. The `logging.level.*` properties affect Spring and Netty framework logging only.
+</Note>
+
+### Writing logs to a file
+
+```properties application.properties
+logging.file.name=logs/romp-gps.log
+logging.file.max-size=50MB
+logging.file.max-history=7
+```

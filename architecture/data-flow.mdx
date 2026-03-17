@@ -1,0 +1,218 @@
+---
+title: End-to-End Data Flow
+description: Step-by-step walkthrough of how GPS device data travels from a TCP connection through the GT06 decoder, into the GPSData model, and is forwarded to the backend via HTTP POST.
+---
+
+This page traces a complete GPS location event from the moment the hardware device opens a TCP connection to the point where the backend receives a JSON payload.
+
+## Full flow overview
+
+```
+GPS Device
+    │
+    │  1. TCP connect → port 9000
+    ▼
+ServerTcp (Netty NioServerSocketChannel)
+    │
+    │  2. New channel → GpsInitializer.initChannel()
+    ▼
+GpsServerHandler.channelActive()
+    │
+    │  3. Login packet (0x01)
+    ▼
+GpsServerHandler.login()
+    │  — decode 8-byte BCD IMEI via GT06Utils.decodificarIMEI()
+    │  — read 2-byte serial number
+    │  — build ACK via GT06Utils.ACK(serial)
+    │
+    │  4. ACK → TCP back to device
+    ▼
+GPS Device (registered)
+    │
+    │  5. Location packet (0x12)
+    ▼
+GpsServerHandler.ubicacion()
+    │  — parse 6 datetime bytes (year+2000, month, day, hour, min, sec)
+    │  — skip 1 padding byte
+    │  — read latRaw (int32), lonRaw (int32)
+    │  — read speed (uint8), courseStatus (uint16)
+    │  — convert: lat = latRaw / 1_800_000.0
+    │  — convert: lon = lonRaw / 1_800_000.0
+    │  — apply hemisphere flags from courseStatus bits
+    │  — build GPSData object
+    ▼
+GPSData (model)
+    │
+    │  6. GpsDataService.recibirData(gpsData)
+    ▼
+SendHTTP.EnviaDatos(gpsData)
+    │  — POST ${backend.base-url}/gps/data
+    ▼
+Backend (external)
+```
+
+## Step-by-step walkthrough
+
+<Steps>
+  <Step title="Device connects">
+    The GPS hardware device opens a TCP connection to the server on **port 9000**.
+
+    `ServerTcp` has already started a `NioServerSocketChannel` on that port during Spring Boot startup (`@PostConstruct`). Netty's `aceptarConexiones` event loop accepts the connection and hands it to the `procesaDatos` worker pool.
+
+    `GpsServerHandler.channelActive()` fires and logs the device's remote address.
+  </Step>
+
+  <Step title="Channel pipeline initialised">
+    For every new `SocketChannel`, `GpsInitializer.initChannel()` builds a fresh `ChannelPipeline` containing a single handler: `GpsServerHandler`.
+
+    Because `GpsServerHandler` is annotated `@Sharable`, the same Spring bean instance handles all channels — keep this in mind for the instance fields `imei` and `accOn`, which are **per-bean, not per-channel**.
+  </Step>
+
+  <Step title="Login packet received and decoded">
+    The device sends a login packet (`protocol = 0x01`) as its first message.
+
+    `GpsServerHandler.channelRead0` validates the `0x78 0x78` start bytes, reads the length, slices the content buffer, and dispatches to `login()`:
+
+    - The 8-byte BCD IMEI is decoded by `GT06Utils.decodificarIMEI()` and stored in the handler's `imei` field.
+    - The 2-byte serial number is read and passed to `GT06Utils.ACK(serial)` to build the response.
+  </Step>
+
+  <Step title="ACK sent to device">
+    `contexto.writeAndFlush(respuesta_ack)` sends the 10-byte login ACK back over TCP:
+
+    ```
+    78 78 05 01 [serial_hi] [serial_lo] [crc_lo] [crc_hi] 0D 0A
+    ```
+
+    The device considers itself registered with the server once this ACK is received.
+  </Step>
+
+  <Step title="Location packet received and decoded">
+    The device sends a location packet (`protocol = 0x12`). `GpsServerHandler.ubicacion()` parses the payload:
+
+    1. Six datetime bytes → human-readable timestamp string (`"Año: 2024 Mes: 5 Dia: 15 Hora: 10 Minuto: 30 Segundo: 0"`).
+    2. One padding byte discarded.
+    3. Two signed 32-bit integers for raw latitude and longitude, each divided by **1,800,000** to get decimal degrees.
+    4. One speed byte (km/h).
+    5. One unsigned 16-bit `courseStatus` field; bits `0x0400`, `0x0800`, `0x1000` resolve GPS validity, west hemisphere, and south hemisphere respectively.
+  </Step>
+
+  <Step title="GPSData object constructed">
+    All decoded fields are assembled into a `GPSData` value object:
+
+    ```java
+    GPSData gps = new GPSData(
+        imei,        // from login packet
+        tiempo,      // formatted timestamp string
+        latitud,     // decimal degrees, sign applied
+        longitud,    // decimal degrees, sign applied
+        velocidad,   // km/h
+        gpsValido,   // courseStatus bit 0x0400
+        accOn,       // from most recent heartbeat, bit 0x04
+        corteMotor   // currently always false
+    );
+    ```
+  </Step>
+
+  <Step title="Service layer forwards data">
+    `GpsDataService.recibirData(gpsData)` receives the object and calls `SendHTTP.EnviaDatos(gpsData)`, delegating all HTTP transport concerns to the infrastructure layer.
+  </Step>
+
+  <Step title="HTTP POST to backend">
+    `SendHTTP` builds the target URL and issues the POST:
+
+    ```java
+    String url = backendUrl + "/gps/data";
+    restTemplate.postForObject(url, gpsData, Void.class);
+    ```
+
+    Spring's `RestTemplate` serialises `GPSData` to JSON using Jackson and sends it as the request body with `Content-Type: application/json`.
+  </Step>
+</Steps>
+
+---
+
+## GPSData model
+
+All fields are immutable (`final`). The class provides only getters — no setters.
+
+| Field | Java type | Description |
+|---|---|---|
+| `imei` | `String` | 15-digit device identifier decoded from the login packet |
+| `timestamp` | `String` | Human-readable datetime: `"Año: Y Mes: M Dia: D Hora: H Minuto: m Segundo: s"` |
+| `latitud` | `double` | Decimal degrees; negative = southern hemisphere |
+| `longitud` | `double` | Decimal degrees; negative = western hemisphere |
+| `velocidad` | `int` | Speed in km/h |
+| `gpsValido` | `boolean` | `true` when `courseStatus & 0x0400` is set |
+| `acc` | `boolean` | Ignition/accessory state from the most recent heartbeat (`terminalInfo & 0x04`) |
+| `corteMotor` | `boolean` | Engine cut state — currently always `false` |
+
+### Example JSON payload
+
+This is what `SendHTTP` POSTs to the backend:
+
+```json
+{
+  "imei": "865328054123456",
+  "timestamp": "Año: 2024 Mes: 5 Dia: 15 Hora: 10 Minuto: 30 Segundo:0",
+  "latitud": -34.603722,
+  "longitud": -58.381592,
+  "velocidad": 42,
+  "gpsValido": true,
+  "acc": true,
+  "corteMotor": false
+}
+```
+
+---
+
+## HTTP endpoints
+
+### Outbound — SendHTTP
+
+`SendHTTP` posts decoded GPS data to the external backend.
+
+| Property | Value |
+|---|---|
+| Method | `POST` |
+| URL | `${backend.base-url}/gps/data` |
+| Body | `GPSData` serialised as JSON |
+| Response | Ignored (`Void.class`) |
+
+Configure the base URL in `application.properties`:
+
+```properties
+backend.base-url=https://your-backend-host
+```
+
+### Inbound — DataController
+
+`DataController` exposes a secondary HTTP entry point that allows other services (or tests) to inject GPS data directly into the same processing pipeline without a TCP connection.
+
+| Property | Value |
+|---|---|
+| Method | `POST` |
+| Path | `/data/ubicacion` |
+| Request body | `GPSData` JSON |
+| Response | `204 No Content` |
+
+```bash
+curl -X POST http://localhost:8080/data/ubicacion \
+  -H "Content-Type: application/json" \
+  -d '{
+    "imei": "865328054123456",
+    "timestamp": "Año: 2024 Mes: 5 Dia: 15 Hora: 10 Minuto: 30 Segundo:0",
+    "latitud": -34.603722,
+    "longitud": -58.381592,
+    "velocidad": 42,
+    "gpsValido": true,
+    "acc": true,
+    "corteMotor": false
+  }'
+```
+
+Internally the controller calls `GpsDataService.recibirData()`, which follows the same path as data arriving over TCP — through `SendHTTP` to the backend.
+
+<Warning>
+Because `GpsServerHandler` is `@Sharable`, `imei` and `accOn` are instance fields shared across all TCP connections. Concurrent connections from different devices will overwrite each other's state. This is a known limitation of the current implementation.
+</Warning>

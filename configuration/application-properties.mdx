@@ -1,0 +1,103 @@
+---
+title: Application Properties
+description: Configuration reference for ROMP-GPS (ServidorTPC) application.properties settings.
+---
+
+ROMP-GPS is configured through Spring Boot's standard `application.properties` file located at
+`src/main/resources/application.properties`. There are only two application-level properties to
+configure — the TCP server port is hardcoded and the HTTP port follows Spring Boot's default.
+
+## Properties reference
+
+<ParamField path="spring.application.name" type="string" default="ServidorTPC">
+  The internal name of the Spring Boot application. Used in logs and Spring Boot Actuator
+  endpoints (e.g. `/actuator/info`). Change this if you need to distinguish multiple
+  deployments in a shared monitoring system.
+</ParamField>
+
+<ParamField path="backend.base-url" type="string" default="http://localhost:8081" required>
+  The base URL of the backend service that receives forwarded GPS data. The server appends
+  `/gps/data` to this value and issues an HTTP POST for every parsed GT06 packet.
+
+  Spring injects this value into `SendHTTP` via `@Value("${backend.base-url}")` in the
+  constructor, so the full request URL becomes:
+
+  ```
+  {backend.base-url}/gps/data
+  ```
+
+  In production, set this to the reachable address of your backend API.
+</ParamField>
+
+## Ports
+
+Two ports are used by the server. Neither is controlled by `application.properties`:
+
+| Port | Protocol | Purpose | Configured in |
+|------|----------|---------|---------------|
+| `9000` | TCP | Receives raw GT06 frames from GPS devices | Hardcoded in `ServerTcp.java` (`int puerto = 9000`) |
+| `8080` | HTTP | Spring Boot REST API and Actuator endpoints | Spring Boot default (exposed via `EXPOSE 8080` in Dockerfile) |
+
+<Note>
+  The TCP port (`9000`) cannot currently be changed through properties — it is set directly
+  in `ServerTcp.java`. To use a different port, update the `puerto` field in that class
+  and rebuild.
+</Note>
+
+## Environment variable overrides
+
+Spring Boot automatically maps environment variables to properties using uppercase and
+underscore notation. You can override any property at runtime without modifying the file:
+
+| Property | Environment variable |
+|----------|---------------------|
+| `backend.base-url` | `BACKEND_BASE_URL` |
+| `spring.application.name` | `SPRING_APPLICATION_NAME` |
+
+This is the recommended approach for Docker and cloud deployments where baking the URL
+into the image is undesirable.
+
+## Complete example
+
+```properties
+# application.properties
+
+# Application identity
+spring.application.name=ServidorTPC
+
+# Backend service that receives forwarded GPS data
+# The server POSTs to {backend.base-url}/gps/data
+backend.base-url=http://localhost:8081
+```
+
+## How backend.base-url is used in code
+
+The `SendHTTP` component receives the URL through constructor injection:
+
+```java
+@Component
+public class SendHTTP {
+
+    private final RestTemplate restTemplate;
+    private final String backendUrl;
+
+    public SendHTTP(RestTemplate restTemplate,
+                    @Value("${backend.base-url}") String backendUrl) {
+        this.restTemplate = restTemplate;
+        this.backendUrl = backendUrl;
+    }
+
+    public void EnviaDatos(GPSData gpsData) {
+        String url = backendUrl + "/gps/data";
+        restTemplate.postForObject(url, gpsData, Void.class);
+    }
+}
+```
+
+The `RestTemplate` bean itself is provided by `ClienteConfig` using a plain `new RestTemplate()`
+with no custom timeouts or interceptors configured.
+
+<Warning>
+  The default `backend.base-url` points to `localhost:8081`, which is only valid when
+  the backend runs on the same host. Always override this value in production.
+</Warning>

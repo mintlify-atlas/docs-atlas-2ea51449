@@ -1,0 +1,81 @@
+---
+title: "Introduction"
+description: "ROMP-GPS is a Spring Boot TCP server that receives GT06 protocol GPS device data, decodes it in real time, and forwards it to a backend service via HTTP."
+---
+
+## What is ROMP-GPS?
+
+ROMP-GPS is a high-performance GPS tracking server built with Spring Boot and Netty. It acts as the middleware layer between GT06-compatible GPS hardware devices and your backend application. The server listens for raw binary TCP connections from GPS trackers, decodes the GT06 protocol frames, and forwards structured location data to a configurable HTTP endpoint.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Deploy and connect your first GPS device in minutes
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Understand how the server components work together
+  </Card>
+  <Card title="GT06 Protocol" icon="signal" href="/architecture/gt06-protocol">
+    Deep dive into the binary protocol used by GPS trackers
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore the HTTP and TCP API surfaces
+  </Card>
+</CardGroup>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="GT06 TCP server" icon="network-wired">
+    Netty-powered TCP server on port 9000 that handles concurrent GPS device connections with non-blocking I/O.
+  </Card>
+  <Card title="IMEI authentication" icon="fingerprint">
+    Devices authenticate via GT06 login packets. The server decodes the BCD-encoded IMEI and sends an ACK response.
+  </Card>
+  <Card title="Real-time location decoding" icon="location-dot">
+    Decodes raw GT06 location frames into structured GPS data: latitude, longitude, speed, and validity flag.
+  </Card>
+  <Card title="Heartbeat handling" icon="heart-pulse">
+    Responds to device heartbeat packets and tracks ACC (ignition) status from terminal info bits.
+  </Card>
+  <Card title="HTTP forwarding" icon="arrow-right-arrow-left">
+    Forwards decoded GPS data to a configurable backend URL via HTTP POST using Spring's RestTemplate.
+  </Card>
+  <Card title="Docker ready" icon="docker">
+    Ships with a Dockerfile for easy containerized deployment on any infrastructure.
+  </Card>
+</CardGroup>
+
+## How it works
+
+ROMP-GPS operates as a bridge between two protocols:
+
+1. **Inbound (TCP/GT06)** — GPS tracking devices connect to TCP port 9000 and send binary-framed GT06 packets. The server handles three message types: Login (`0x01`), Location (`0x12`), and Heartbeat (`0x13`).
+
+2. **Outbound (HTTP)** — Decoded GPS data is forwarded as a JSON POST request to your backend service at the URL configured in `application.properties`.
+
+```
+GPS Device ──TCP/GT06──► ROMP-GPS Server ──HTTP POST──► Your Backend
+                          (port 9000)                   (/gps/data)
+```
+
+## Technology stack
+
+| Component | Technology |
+|-----------|------------|
+| Runtime | Java 17 |
+| Framework | Spring Boot 4.x |
+| TCP server | Netty (via `netty-all`) |
+| HTTP client | Spring RestTemplate |
+| Build tool | Maven |
+| Container | Docker (eclipse-temurin:17-jdk) |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Get up and running" icon="play" href="/quickstart">
+    Follow the quickstart guide to deploy the server and connect a GPS device
+  </Card>
+  <Card title="Explore the architecture" icon="sitemap" href="/architecture/overview">
+    Learn about the component structure and data flow
+  </Card>
+</CardGroup>

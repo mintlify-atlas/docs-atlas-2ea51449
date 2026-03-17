@@ -1,0 +1,115 @@
+---
+title: Receive GPS Data
+description: HTTP endpoint that accepts a decoded GPS location record and forwards it to the configured backend.
+---
+
+## POST /data/ubicacion
+
+Accepts a `GPSData` JSON object, passes it through `GpsDataService`, and forwards it to the upstream backend via `SendHTTP`. Returns `204 No Content` on success.
+
+This endpoint can be called directly by any HTTP client **or** is invoked internally by the Netty GT06 handler after it decodes a location frame from a connected device.
+
+<Note>
+The controller is defined in `DataController.java` with `@RequestMapping("/data/ubicacion")` and a single `@PostMapping` method that delegates to `GpsDataService.recibirData()`.
+</Note>
+
+### Request
+
+```
+POST /data/ubicacion
+Content-Type: application/json
+```
+
+#### Body fields
+
+<ParamField body="imei" type="string" required>
+  Device IMEI (15 digits). BCD-decoded by the Netty handler from the 8-byte login frame payload. Example: `"353816051234567"`
+</ParamField>
+
+<ParamField body="timestamp" type="string" required>
+  Human-readable timestamp assembled by the location handler.
+  Format: `"Año: 2024 Mes: 6 Dia: 15 Hora: 10 Minuto: 30 Segundo:45"`
+</ParamField>
+
+<ParamField body="latitud" type="number" required>
+  Latitude in decimal degrees. Negative values indicate the southern hemisphere.
+  Derived from the raw 32-bit integer in the GT06 frame: `latRaw / 1,800,000.0`, negated when courseStatus bit `0x1000` is set.
+</ParamField>
+
+<ParamField body="longitud" type="number" required>
+  Longitude in decimal degrees. Negative values indicate west of the prime meridian.
+  Derived from the raw 32-bit integer in the GT06 frame: `lonRaw / 1,800,000.0`, negated when courseStatus bit `0x0800` is set.
+</ParamField>
+
+<ParamField body="velocidad" type="integer" required>
+  Speed in km/h. Read from the single unsigned byte at offset 13 of the location frame content.
+</ParamField>
+
+<ParamField body="gpsValido" type="boolean" required>
+  `true` when the GPS fix is valid. Corresponds to bit `0x0400` of the `courseStatus` field in the GT06 location frame.
+</ParamField>
+
+<ParamField body="acc" type="boolean" required>
+  Ignition / ACC status. Sourced from bit `0x04` of the `terminalInfo` byte in the most recent heartbeat frame received on the same TCP connection.
+</ParamField>
+
+<ParamField body="corteMotor" type="boolean" required>
+  Motor-cut relay status. Currently hardcoded to `false` in `GpsServerHandler`; reserved for future use.
+</ParamField>
+
+### Response
+
+| Status | Meaning |
+|--------|---------|
+| `204 No Content` | Data accepted and forwarded to backend. |
+
+No response body is returned on success.
+
+### Examples
+
+<Tabs>
+  <Tab title="curl">
+```bash
+curl -X POST http://localhost:8080/data/ubicacion \
+  -H "Content-Type: application/json" \
+  -d '{
+    "imei": "353816051234567",
+    "timestamp": "Año: 2024 Mes: 6 Dia: 15 Hora: 10 Minuto: 30 Segundo:45",
+    "latitud": 19.432608,
+    "longitud": -99.133209,
+    "velocidad": 42,
+    "gpsValido": true,
+    "acc": true,
+    "corteMotor": false
+  }'
+```
+  </Tab>
+  <Tab title="JSON body">
+```json
+{
+  "imei": "353816051234567",
+  "timestamp": "Año: 2024 Mes: 6 Dia: 15 Hora: 10 Minuto: 30 Segundo:45",
+  "latitud": 19.432608,
+  "longitud": -99.133209,
+  "velocidad": 42,
+  "gpsValido": true,
+  "acc": true,
+  "corteMotor": false
+}
+```
+  </Tab>
+</Tabs>
+
+### Backend forwarding
+
+After `GpsDataService.recibirData()` is called, `SendHTTP.EnviaDatos()` immediately POSTs the same JSON body to:
+
+```
+POST ${backend.base-url}/gps/data
+```
+
+The `backend.base-url` property must be set in `application.properties`, for example:
+
+```properties
+backend.base-url=http://my-backend-host:8081
+```

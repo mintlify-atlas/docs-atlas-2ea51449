@@ -1,0 +1,182 @@
+---
+title: Deployment
+description: How to build and run ROMP-GPS locally with Maven or in a container with Docker.
+---
+
+ROMP-GPS can be deployed in two ways: directly on any machine with a JDK 17+ using Maven,
+or as a Docker container using the provided `Dockerfile`.
+
+## Port requirements
+
+Before deploying, ensure both ports are reachable by the expected clients:
+
+| Port | Protocol | Inbound clients |
+|------|----------|-----------------|
+| `9000` | TCP | GPS tracking devices (GT06 protocol) |
+| `8080` | HTTP | REST API consumers, Actuator monitoring |
+
+<Warning>
+  Port `9000` must be reachable from every GPS device you want to track. Check firewall
+  rules and network ACLs before deploying to a remote server.
+</Warning>
+
+---
+
+## Deployment options
+
+<Tabs>
+  <Tab title="Local (Maven)">
+    Run directly on the host using the Maven wrapper included in the repository.
+    Requires **Java 17** and network access to your backend service.
+
+    <Steps>
+      <Step title="Build the JAR">
+        From the project root, package the application and skip tests:
+
+        ```bash
+        ./mvnw clean package -DskipTests
+        ```
+
+        The compiled artifact is written to `target/servidor-tpc-0.0.1-SNAPSHOT.jar`.
+      </Step>
+
+      <Step title="Configure the backend URL">
+        Set the backend URL using an environment variable so you don't have to modify
+        `application.properties`:
+
+        ```bash
+        export BACKEND_BASE_URL=http://your-backend-host:8081
+        ```
+
+        Alternatively, edit `src/main/resources/application.properties` directly before
+        running the build:
+
+        ```properties
+        backend.base-url=http://your-backend-host:8081
+        ```
+      </Step>
+
+      <Step title="Start the server">
+        ```bash
+        java -jar target/servidor-tpc-0.0.1-SNAPSHOT.jar
+        ```
+
+        You should see the following line confirming the TCP listener is active:
+
+        ```
+        TCP GPS Server escuchando en puerto 9000
+        ```
+
+        The Spring Boot HTTP server starts on port `8080`.
+      </Step>
+    </Steps>
+
+    <Tip>
+      You can also pass the backend URL directly on the command line without setting an
+      environment variable:
+
+      ```bash
+      java -jar target/servidor-tpc-0.0.1-SNAPSHOT.jar \
+        --backend.base-url=http://your-backend-host:8081
+      ```
+    </Tip>
+  </Tab>
+
+  <Tab title="Docker">
+    Run inside a container using the provided `Dockerfile`. The image is based on
+    `eclipse-temurin:17-jdk`.
+
+    <Steps>
+      <Step title="Build the JAR first">
+        The `Dockerfile` copies from `target/`, so the JAR must exist before building
+        the image:
+
+        ```bash
+        ./mvnw clean package -DskipTests
+        ```
+      </Step>
+
+      <Step title="Build the Docker image">
+        ```bash
+        docker build -t romp-gps:latest .
+        ```
+      </Step>
+
+      <Step title="Run the container">
+        Map both ports and pass the backend URL as an environment variable:
+
+        ```bash
+        docker run -d \
+          --name romp-gps \
+          -p 9000:9000 \
+          -p 8080:8080 \
+          -e BACKEND_BASE_URL=http://your-backend-host:8081 \
+          romp-gps:latest
+        ```
+
+        | Flag | Purpose |
+        |------|---------|
+        | `-p 9000:9000` | Exposes the Netty TCP listener to GPS devices |
+        | `-p 8080:8080` | Exposes the Spring Boot HTTP server |
+        | `-e BACKEND_BASE_URL=...` | Overrides `backend.base-url` at runtime |
+      </Step>
+
+      <Step title="Verify startup">
+        Check that both listeners came up:
+
+        ```bash
+        docker logs romp-gps
+        ```
+
+        Look for:
+        - `TCP GPS Server escuchando en puerto 9000` — Netty TCP server ready
+        - `Started ServidorTpcApplication` — Spring Boot HTTP server ready
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+---
+
+## Passing the backend URL
+
+<CodeGroup>
+
+```bash Environment variable
+# Works for both local and Docker deployments.
+# Spring Boot maps BACKEND_BASE_URL → backend.base-url automatically.
+export BACKEND_BASE_URL=http://your-backend-host:8081
+java -jar target/servidor-tpc-0.0.1-SNAPSHOT.jar
+```
+
+```bash Command-line property
+# Override inline without setting an env var.
+java -jar target/servidor-tpc-0.0.1-SNAPSHOT.jar \
+  --backend.base-url=http://your-backend-host:8081
+```
+
+```properties application.properties
+# Edit before building. Bakes the URL into the JAR.
+backend.base-url=http://your-backend-host:8081
+```
+
+</CodeGroup>
+
+---
+
+## Production considerations
+
+- **Configure a real backend URL.** The default `http://localhost:8081` only works when
+  the backend runs on the same host. Use `BACKEND_BASE_URL` or `--backend.base-url` to
+  point to the production backend before starting the server.
+
+- **Open port 9000 to GPS devices.** Every device sending GT06 data must be able to
+  reach TCP port `9000`. Verify firewall rules, cloud security groups, and any NAT
+  configuration on the host running ROMP-GPS.
+
+- **Monitor via Actuator.** Spring Boot Actuator is included as a dependency. Health and
+  metrics endpoints are available at `http://<host>:8080/actuator` once the server is
+  running.
+
+- **JDK vs JRE image.** The `Dockerfile` uses `eclipse-temurin:17-jdk`. For a smaller
+  production image, switch the base image to `eclipse-temurin:17-jre`.

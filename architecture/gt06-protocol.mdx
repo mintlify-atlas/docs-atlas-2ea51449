@@ -1,0 +1,231 @@
+---
+title: GT06 Protocol Reference
+description: Detailed breakdown of the GT06 binary protocol as implemented in ROMP-GPS — packet framing, message types, bit flags, ACK formats, and CRC-16 algorithm.
+---
+
+GT06 is a compact binary protocol used by many low-cost GPS tracker hardware devices. All multi-byte integers are **big-endian** unless noted otherwise.
+
+## Packet frame structure
+
+Every GT06 packet is wrapped in the same outer frame:
+
+```
+┌────────┬────────┬────────┬──────────┬─────────────────┬──────────┬────────┬────────┐
+│  0x78  │  0x78  │ Length │ Protocol │     Content     │ CRC (2B) │  0x0D  │  0x0A  │
+│ 1 byte │ 1 byte │ 1 byte │  1 byte  │  Length bytes   │          │ 1 byte │ 1 byte │
+└────────┴────────┴────────┴──────────┴─────────────────┴──────────┴────────┴────────┘
+```
+
+| Field | Size | Description |
+|---|---|---|
+| Start bytes | 2 bytes | Always `0x78 0x78` — marks the beginning of a packet |
+| Length | 1 byte | Number of bytes that follow, up to (but not including) the CRC and end bytes |
+| Protocol | 1 byte | Message type identifier (see table below) |
+| Content | Variable | Message-specific payload (see per-type sections below) |
+| CRC | 2 bytes | CRC-16 over the bytes from **Length** through the end of **Content** |
+| End bytes | 2 bytes | Always `0x0D 0x0A` |
+
+<Note>
+`GpsServerHandler.channelRead0` validates the start bytes before processing and reads the CRC field after dispatching each message, but does not currently verify the CRC value.
+</Note>
+
+## Supported message types
+
+| Protocol byte | Name | Direction | ACK required |
+|---|---|---|---|
+| `0x01` | Login | Device → Server | Yes |
+| `0x12` | Location | Device → Server | No |
+| `0x13` | Heartbeat | Device → Server | Yes |
+
+---
+
+## Login packet (0x01)
+
+The first packet a device sends after establishing a TCP connection. Contains the device IMEI so the server can identify it.
+
+### Frame layout
+
+```
+┌──────┬──────┬──────┬──────┬───────────────────┬─────────┬──────────┬──────┬──────┐
+│ 0x78 │ 0x78 │ 0x0F │ 0x01 │  IMEI (8 bytes)   │ Serial  │ CRC (2B) │ 0x0D │ 0x0A │
+│      │      │      │      │  BCD-encoded       │ 2 bytes │          │      │      │
+└──────┴──────┴──────┴──────┴───────────────────┴─────────┴──────────┴──────┴──────┘
+```
+
+| Field | Size | Notes |
+|---|---|---|
+| Start | 2 bytes | `0x78 0x78` |
+| Length | 1 byte | `0x0F` (15) — protocol + 8 IMEI + 2 serial |
+| Protocol | 1 byte | `0x01` |
+| IMEI | 8 bytes | BCD-encoded: each nibble is one IMEI digit |
+| Serial number | 2 bytes | Packet sequence number; echoed back in the ACK |
+| CRC | 2 bytes | Over length + protocol + IMEI + serial |
+| End | 2 bytes | `0x0D 0x0A` |
+
+### IMEI decoding
+
+The IMEI is stored as 8 BCD-encoded bytes. Each byte holds two decimal digits — the high nibble is the first digit, the low nibble is the second:
+
+```java
+// GT06Utils.decodificarIMEI
+for (byte b : bytes) {
+    imei.append((b >> 4) & 0x0F); // high nibble
+    imei.append(b & 0x0F);        // low nibble
+}
+```
+
+### ACK response
+
+The server echoes the serial number back to confirm successful login:
+
+```
+┌──────┬──────┬──────┬──────┬─────────┬──────────┬──────┬──────┐
+│ 0x78 │ 0x78 │ 0x05 │ 0x01 │ Serial  │ CRC (2B) │ 0x0D │ 0x0A │
+│      │      │      │      │ 2 bytes │ LE       │      │      │
+└──────┴──────┴──────┴──────┴─────────┴──────────┴──────┴──────┘
+```
+
+<Note>
+The login ACK CRC is written **little-endian** (low byte first): `paquete.writeByte(crc & 0xFF)` then `paquete.writeByte((crc >> 8) & 0xFF)`. This matches the hardware expectation for the login response.
+</Note>
+
+---
+
+## Location packet (0x12)
+
+Carries a full GPS fix with timestamp, coordinates, speed, and status flags.
+
+### Frame layout
+
+```
+┌──────┬──────┬──────┬──────┬──────────────────────────────────────────────────┬──────────┬──────┬──────┐
+│ 0x78 │ 0x78 │  Len │ 0x12 │                   Content                        │ CRC (2B) │ 0x0D │ 0x0A │
+└──────┴──────┴──────┴──────┴──────────────────────────────────────────────────┴──────────┴──────┴──────┘
+
+Content breakdown:
+┌────────┬─────┬─────┬──────┬────────┬─────────┬───────┬─────────────┬─────────────┬──────────┬─────────────────┐
+│  Year  │ Mon │ Day │ Hour │  Min   │   Sec   │  Pad  │ Lat (4B)    │ Lon (4B)    │ Speed    │ courseStatus    │
+│ 1 byte │ 1B  │ 1B  │  1B  │  1B    │   1B    │  1B   │ signed int  │ signed int  │ 1 byte   │ unsigned short  │
+└────────┴─────┴─────┴──────┴────────┴─────────┴───────┴─────────────┴─────────────┴──────────┴─────────────────┘
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| Year | `uint8` | Offset from 2000 — e.g. `0x18` = 2024 |
+| Month | `uint8` | 1–12 |
+| Day | `uint8` | 1–31 |
+| Hour | `uint8` | 0–23 |
+| Minute | `uint8` | 0–59 |
+| Second | `uint8` | 0–59 |
+| Padding | `uint8` | Read and discarded by the server |
+| Latitude | `int32` | Raw value; divide by **1,800,000** for decimal degrees |
+| Longitude | `int32` | Raw value; divide by **1,800,000** for decimal degrees |
+| Speed | `uint8` | km/h |
+| courseStatus | `uint16` | Bitfield — see table below |
+
+### courseStatus bit flags
+
+| Bit mask | Name | Meaning when set |
+|---|---|---|
+| `0x0400` | `gpsValido` | GPS fix is valid |
+| `0x0800` | `oeste` (west) | Longitude is in the western hemisphere — negate the value |
+| `0x1000` | `sur` (south) | Latitude is in the southern hemisphere — negate the value |
+
+```java
+// GpsServerHandler.ubicacion
+boolean gpsValido = (courseStatus & 0x0400) != 0;
+boolean oeste     = (courseStatus & 0x0800) != 0;
+boolean sur       = (courseStatus & 0x1000) != 0;
+
+double latitud  = latitudCruda  / 1800000.0;
+double longitud = longitudCruda / 1800000.0;
+
+if (sur)   latitud  = -latitud;
+if (oeste) longitud = -longitud;
+```
+
+### Example byte sequence
+
+```
+78 78          — start bytes
+13             — length (19 bytes)
+12             — protocol: location
+18 05 0F 0A 1E 00  — 2024-05-15 10:30:00 (year offset + 0x00 pad)
+01 34 F5 E0    — latitude raw = 0x0134F5E0 = 20,olean / 1,800,000 ≈ 11.2°
+00 A8 B4 40    — longitude raw
+00             — speed: 0 km/h
+14 00          — courseStatus: bit 0x0400 set = GPS valid, northern + eastern hemisphere
+XX XX          — CRC
+0D 0A          — end bytes
+```
+
+---
+
+## Heartbeat packet (0x13)
+
+Periodically sent by the device to keep the TCP connection alive and report device status.
+
+### Frame layout
+
+```
+┌──────┬──────┬──────┬──────┬──────────────┬─────────┬─────────┬──────────┬──────┬──────┐
+│ 0x78 │ 0x78 │ 0x05 │ 0x13 │ terminalInfo │ GSM lvl │ Serial  │ CRC (2B) │ 0x0D │ 0x0A │
+│      │      │      │      │   1 byte     │ 1 byte  │ 2 bytes │          │      │      │
+└──────┴──────┴──────┴──────┴──────────────┴─────────┴─────────┴──────────┴──────┴──────┘
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| terminalInfo | `int8` | Bitfield — see table below |
+| GSM signal level | `uint8` | Raw signal strength value from modem |
+| Serial number | `int16` | Packet sequence number; echoed in ACK |
+
+### terminalInfo bit flags
+
+| Bit mask | Name | Meaning when set |
+|---|---|---|
+| `0x04` | `acc` | ACC (ignition / accessory power) is ON |
+
+```java
+// GpsServerHandler.heartbeat
+byte terminalInfo = contenido.readByte();
+accOn = (terminalInfo & 0x04) != 0;
+```
+
+### ACK response
+
+```
+┌──────┬──────┬──────┬──────┬─────────┬──────────┬──────┬──────┐
+│ 0x78 │ 0x78 │ 0x05 │ 0x13 │ Serial  │ CRC (2B) │ 0x0D │ 0x0A │
+│      │      │      │      │ 2 bytes │ BE       │      │      │
+└──────┴──────┴──────┴──────┴─────────┴──────────┴──────┴──────┘
+```
+
+The heartbeat ACK CRC is written **big-endian** via `buffer.writeShort(crc)`, which differs from the login ACK.
+
+---
+
+## CRC-16 algorithm
+
+The GT06 implementation uses a bitwise CRC-16 with the **0x8408** polynomial (bit-reversed CRC-CCITT), with an initial value of `0xFFFF` and a final bitwise inversion:
+
+```java
+// GT06Utils.calcularCRC
+public static int calcularCRC(byte[] data) {
+    int crc = 0xFFFF;
+    for (byte b : data) {
+        crc ^= (b & 0xFF);
+        for (int i = 0; i < 8; i++) {
+            if ((crc & 1) != 0) {
+                crc = (crc >> 1) ^ 0x8408;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc = ~crc;          // final inversion
+    return crc & 0xFFFF; // mask to 16 bits
+}
+```
+
+The CRC input for **login and heartbeat ACKs** is the slice starting at the **Length byte** up through the last byte of the payload (protocol + content), excluding the start bytes, CRC itself, and end bytes.

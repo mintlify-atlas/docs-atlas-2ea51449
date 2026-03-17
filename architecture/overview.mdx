@@ -1,0 +1,87 @@
+---
+title: Architecture Overview
+description: High-level overview of the ROMP-GPS system — a Spring Boot + Netty TCP server that receives GT06 protocol GPS device data and forwards it to a backend via HTTP.
+---
+
+ROMP-GPS is composed of two distinct processing layers:
+
+- **TCP/GT06 inbound layer** — a Netty-based TCP server that accepts raw binary packets from GPS hardware devices using the GT06 protocol.
+- **HTTP outbound layer** — a Spring `RestTemplate` client that serialises decoded GPS data into JSON and POSTs it to a configured backend URL.
+
+The Spring Boot application bootstraps both layers on startup and keeps them running for the lifetime of the process.
+
+## System diagram
+
+```
+┌──────────────┐     TCP :9000      ┌─────────────────────────────────────────────────┐
+│  GPS Device  │ ─── binary GT06 ──▶│                  ROMP-GPS Server                │
+│  (hardware)  │                    │                                                 │
+└──────────────┘                    │  GpsInitializer                                 │
+                                    │       └─▶ GpsServerHandler                     │
+                                    │               ├─ login()   → ACK               │
+                                    │               ├─ ubicacion() → GPSData         │
+                                    │               └─ heartbeat() → ACK             │
+                                    │                                                 │
+                                    │  GpsDataService                                │
+                                    │       └─▶ SendHTTP                             │
+                                    │               └─ POST ${backend.base-url}/gps/data │
+                                    └─────────────────────────────────────────────────┘
+                                                            │
+                                                            ▼  HTTP POST (JSON)
+                                                    ┌──────────────┐
+                                                    │   Backend    │
+                                                    └──────────────┘
+```
+
+## Components
+
+<CardGroup cols={2}>
+  <Card title="ServerTcp" icon="server">
+    Spring `@Component` that bootstraps the Netty `ServerBootstrap` on port **9000** using `@PostConstruct`.
+    Manages two `NioEventLoopGroup` instances — one for accepting connections and one for processing I/O — and shuts them down gracefully via `@PreDestroy`.
+  </Card>
+  <Card title="GpsInitializer" icon="sliders">
+    A Netty `ChannelInitializer<SocketChannel>` that configures the pipeline for every new TCP connection.
+    Currently adds a single handler: `GpsServerHandler`.
+  </Card>
+  <Card title="GpsServerHandler" icon="bolt">
+    The core Netty handler (`SimpleChannelInboundHandler<ByteBuf>`). Parses the raw GT06 binary stream, dispatches packets to `login()`, `ubicacion()`, or `heartbeat()` based on the protocol byte, and writes ACK responses back to the device.
+    Marked `@Sharable` so a single bean instance handles all channels.
+  </Card>
+  <Card title="GT06Utils" icon="wrench">
+    Stateless utility class. Provides IMEI BCD decoding (`decodificarIMEI`), CRC-16 calculation (`calcularCRC`), and ACK frame builders for login (`ACK`) and heartbeat (`ACKHeartbeat`).
+  </Card>
+  <Card title="GPSData" icon="location-dot">
+    Immutable model (`final` fields, all-args constructor). Carries the eight decoded fields that are later serialised to JSON: `imei`, `timestamp`, `latitud`, `longitud`, `velocidad`, `gpsValido`, `acc`, `corteMotor`.
+  </Card>
+  <Card title="GpsDataService" icon="gears">
+    Service layer that decouples the handler from the HTTP infrastructure. Accepts a `GPSData` object via `recibirData()` and delegates to `SendHTTP.EnviaDatos()`.
+  </Card>
+  <Card title="SendHTTP" icon="paper-plane">
+    Spring `@Component` that wraps a `RestTemplate`. Reads the backend base URL from `${backend.base-url}` and performs an HTTP POST to `{backendUrl}/gps/data` with the `GPSData` payload.
+  </Card>
+  <Card title="DataController" icon="plug">
+    Spring `@RestController` that exposes an inbound HTTP endpoint `POST /data/ubicacion`. Receives a `GPSData` JSON body and passes it through `GpsDataService` → `SendHTTP` to the external backend.
+  </Card>
+</CardGroup>
+
+## Technology stack
+
+| Layer | Technology |
+|---|---|
+| Application framework | Spring Boot |
+| TCP server | Netty (`NioEventLoopGroup`, `NioServerSocketChannel`) |
+| TCP port | 9000 |
+| Device protocol | GT06 binary |
+| HTTP client | Spring `RestTemplate` |
+| Inbound HTTP | Spring MVC (`@RestController`) |
+
+## Configuration
+
+The only required external configuration property is:
+
+```properties
+backend.base-url=https://your-backend-host
+```
+
+Set it in `application.properties` or via an environment variable (`BACKEND_BASE_URL`). `SendHTTP` appends `/gps/data` to this value when constructing the POST URL.

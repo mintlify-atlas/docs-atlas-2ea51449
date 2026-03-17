@@ -1,0 +1,70 @@
+---
+title: API Overview
+description: Reference for both API surfaces exposed by ROMP-GPS — the HTTP REST endpoint and the GT06 binary TCP server.
+---
+
+ROMP-GPS exposes two distinct API surfaces:
+
+- **HTTP REST** — A Spring Boot REST controller that receives decoded GPS data as JSON. External callers (or the internal Netty handler) POST structured location records here.
+- **TCP Binary (GT06)** — A Netty-based TCP server that GPS hardware devices connect to directly. It speaks the GT06 binary protocol, decodes each frame, and forwards the result to an upstream backend via HTTP.
+
+<Note>
+The server also acts as an **HTTP client**. After decoding a GT06 location frame it POSTs the resulting `GPSData` object to `${backend.base-url}/gps/data` using Spring's `RestTemplate`.
+</Note>
+
+## Quick reference
+
+| Surface | Direction | Transport | Address | Path / Port |
+|---------|-----------|-----------|---------|-------------|
+| REST endpoint | Inbound | HTTP POST | `http://localhost:8080` | `/data/ubicacion` |
+| TCP server | Inbound (devices) | TCP binary (GT06) | `0.0.0.0` | `9000` |
+| Backend forwarding | Outbound | HTTP POST | `${backend.base-url}` | `/gps/data` |
+
+## HTTP REST surface
+
+The Spring Boot application listens on **port 8080** (default). A single endpoint accepts GPS location records as JSON:
+
+```
+POST http://localhost:8080/data/ubicacion
+```
+
+The request body must be a serialised `GPSData` object. On success the server returns `204 No Content`. See [Receive GPS Data](/api/receive-gps-data) for the full field reference.
+
+## TCP binary surface
+
+The Netty TCP server binds to **port 9000** at application startup (`@PostConstruct`). GPS tracking devices establish a persistent TCP connection and exchange GT06 binary frames:
+
+1. Device connects.
+2. Device sends a **Login** frame (`0x01`) containing its IMEI.
+3. Server replies with a login **ACK**.
+4. Device sends **Location** frames (`0x12`) periodically.
+5. Device sends **Heartbeat** frames (`0x13`) to keep the connection alive; server replies with a heartbeat ACK.
+
+See [TCP Server](/api/tcp-server) for the Netty configuration and [GT06 Messages](/api/gt06-messages) for the byte-level frame reference.
+
+## Backend forwarding
+
+Every decoded location frame is forwarded to the configured upstream backend:
+
+```
+POST ${backend.base-url}/gps/data
+Content-Type: application/json
+
+{ ...GPSData fields... }
+```
+
+The `backend.base-url` property is set in `application.properties`. The forwarding is performed by `SendHTTP.EnviaDatos()` which is called from `GpsDataService.recibirData()`.
+
+## Page index
+
+<CardGroup cols={2}>
+  <Card title="Receive GPS Data" href="/api/receive-gps-data">
+    HTTP POST /data/ubicacion — request body fields, response codes, and curl example.
+  </Card>
+  <Card title="TCP Server" href="/api/tcp-server">
+    Netty configuration, connection lifecycle, and frame parsing logic.
+  </Card>
+  <Card title="GT06 Messages" href="/api/gt06-messages">
+    Byte-level reference for Login, Location, and Heartbeat frames.
+  </Card>
+</CardGroup>

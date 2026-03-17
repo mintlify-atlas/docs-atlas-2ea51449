@@ -1,0 +1,170 @@
+---
+title: TCP Server
+description: Netty NIO TCP server that listens on port 9000 and processes GT06 binary frames from GPS tracking devices.
+---
+
+## Overview
+
+The TCP server is implemented with **Netty 4** and starts automatically when the Spring Boot application initialises (`@PostConstruct` on `ServerTcp`). It binds to port `9000` on all interfaces and remains running until the application shuts down (`@PreDestroy`).
+
+```
+TCP 0.0.0.0:9000   ← GT06 devices connect here
+```
+
+## ServerTcp
+
+`ServerTcp` (`com.servidortpc.servidor_tpc.netty.ServerTcp`) is a Spring `@Component` that owns the Netty bootstrap lifecycle.
+
+```java
+@PostConstruct
+public void iniciarServidor() throws Exception {
+    aceptarConexiones = new NioEventLoopGroup(1);   // 1 boss thread
+    procesaDatos     = new NioEventLoopGroup();      // CPU-count worker threads
+
+    new ServerBootstrap()
+        .group(aceptarConexiones, procesaDatos)
+        .channel(NioServerSocketChannel.class)
+        .childHandler(new GpsInitializer())
+        .bind(9000).sync();
+}
+```
+
+| Property | Value |
+|----------|-------|
+| Boss threads | 1 (`NioEventLoopGroup(1)`) |
+| Worker threads | Default — one per available CPU core |
+| Channel type | `NioServerSocketChannel` |
+| Port | `9000` |
+| Child handler | `GpsInitializer` (pipeline setup) |
+
+On shutdown `@PreDestroy` calls `shutdownGracefully()` on both event loop groups.
+
+## Connection lifecycle
+
+```
+Device                       Server (GpsServerHandler)
+  │                               │
+  │──── TCP SYN ─────────────────►│  channelActive() logged
+  │                               │
+  │──── Login frame (0x01) ───────►│  login() → decode IMEI, store in handler
+  │◄─── Login ACK ────────────────│  GT06Utils.ACK(serial)
+  │                               │
+  │──── Location frame (0x12) ────►│  ubicacion() → build GPSData
+  │   (no ACK sent currently)     │
+  │                               │
+  │──── Heartbeat frame (0x13) ───►│  heartbeat() → update accOn flag
+  │◄─── Heartbeat ACK ────────────│  GT06Utils.ACKHeartbeat(serial)
+  │                               │
+  │   ... repeats ...             │
+  │                               │
+  │──── TCP FIN ─────────────────►│  channelInactive() logged
+```
+
+<Note>
+`GpsServerHandler` is annotated `@Sharable`, meaning a single handler instance is shared across all connected channels. The `imei` and `accOn` fields are therefore **per-handler, not per-channel**. In a multi-device deployment, concurrent connections may overwrite each other's state.
+</Note>
+
+## GpsServerHandler
+
+`GpsServerHandler` extends `SimpleChannelInboundHandler<ByteBuf>`. All frame parsing happens in `channelRead0()`.
+
+### Frame parsing algorithm
+
+`channelRead0` loops while at least 5 bytes are available:
+
+1. Mark the reader index.
+2. Read 2 bytes — must be `0x78 0x78` (start of frame). If not, reset and skip one byte.
+3. Read 1 byte — `length` (number of bytes that follow, excluding the trailing CRC and `0x0D 0x0A`).
+4. Check that `readableBytes >= length + 2` (length field + 2 for end bytes). If not, reset and return (wait for more data).
+5. Read a `ByteBuf` slice of `length` bytes — this is `contenido`.
+6. Read 1 byte from `contenido` — protocol number.
+7. Dispatch:
+   - `0x01` → `login(ctx, contenido)`
+   - `0x12` → `ubicacion(contenido)`
+   - `0x13` → `heartbeat(ctx, contenido)`
+8. Read 2 bytes from `paquete` — CRC (not validated, discarded).
+9. Read 2 bytes from `paquete` — end marker `0x0D 0x0A`.
+
+### Supported protocol bytes
+
+| Protocol byte | Message type | ACK sent |
+|---------------|-------------|----------|
+| `0x01` | Login | Yes — `GT06Utils.ACK(serial)` |
+| `0x12` | Location | No |
+| `0x13` | Heartbeat | Yes — `GT06Utils.ACKHeartbeat(serial)` |
+
+## GT06Utils
+
+`GT06Utils` (`com.servidortpc.servidor_tpc.netty.GT06Utils`) provides static helpers for IMEI decoding, CRC calculation, and ACK packet construction.
+
+### `decodificarIMEI(byte[] bytes): String`
+
+BCD-decodes 8 bytes into a 16-character IMEI string. Each byte contributes two decimal digits (high nibble first):
+
+```java
+for (byte b : bytes) {
+    imei.append((b >> 4) & 0x0F);
+    imei.append(b & 0x0F);
+}
+```
+
+A standard 15-digit IMEI is contained in the first 15 of the 16 output characters (the last nibble of byte 8 is a padding zero).
+
+### `calcularCRC(byte[] data): int`
+
+CRC-16 with the following parameters:
+
+| Parameter | Value |
+|-----------|-------|
+| Initial value | `0xFFFF` |
+| Polynomial | `0x8408` (reflected CRC-16/MCRF4XX) |
+| Final XOR | `~crc & 0xFFFF` (inverted, masked to 16 bits) |
+
+```java
+int crc = 0xFFFF;
+for (byte b : data) {
+    crc ^= (b & 0xFF);
+    for (int i = 0; i < 8; i++) {
+        if ((crc & 1) != 0) crc = (crc >> 1) ^ 0x8408;
+        else                crc >>= 1;
+    }
+}
+crc = ~crc;
+return crc & 0xFFFF;
+```
+
+The CRC is calculated over the **length + protocol + content** bytes (everything between the `0x78 0x78` header and the CRC field itself).
+
+### `ACK(short serial): ByteBuf`
+
+Builds a 9-byte login ACK packet.
+
+| Offset | Bytes | Value / Description |
+|--------|-------|---------------------|
+| 0 | 1 | `0x78` — start byte 1 |
+| 1 | 1 | `0x78` — start byte 2 |
+| 2 | 1 | `0x05` — length |
+| 3 | 1 | `0x01` — protocol (login ACK) |
+| 4–5 | 2 | Serial number (big-endian) |
+| 6–7 | 2 | CRC-16 over bytes 2–5 (**little-endian**) |
+| 8 | 1 | `0x0D` |
+| 9 | 1 | `0x0A` |
+
+<Warning>
+The login ACK writes the CRC in **little-endian** order (`crc & 0xFF` first, then `(crc >> 8) & 0xFF`), which differs from the big-endian `writeShort` used in the heartbeat ACK.
+</Warning>
+
+### `ACKHeartbeat(short serial): ByteBuf`
+
+Builds a heartbeat ACK packet with the same 9-byte layout as the login ACK, but with protocol byte `0x13`. CRC is written big-endian via `writeShort(crc)`.
+
+| Offset | Bytes | Value / Description |
+|--------|-------|---------------------|
+| 0 | 1 | `0x78` — start byte 1 |
+| 1 | 1 | `0x78` — start byte 2 |
+| 2 | 1 | `0x05` — length |
+| 3 | 1 | `0x13` — protocol (heartbeat ACK) |
+| 4–5 | 2 | Serial number (big-endian) |
+| 6–7 | 2 | CRC-16 (big-endian) |
+| 8 | 1 | `0x0D` |
+| 9 | 1 | `0x0A` |

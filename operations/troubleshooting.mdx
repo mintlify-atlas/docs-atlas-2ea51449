@@ -1,0 +1,232 @@
+---
+title: Troubleshooting
+description: Solutions to common issues with the ROMP-GPS TCP server, GPS device connectivity, and backend forwarding.
+---
+
+<AccordionGroup>
+  <Accordion title="GPS device cannot connect to port 9000">
+    **Symptoms:** The device attempts to connect but the session is immediately refused or times out. No `GPS Conectado` line appears in the logs.
+
+    **Checks:**
+
+    1. Verify the server started successfully. The following line must be present in the logs:
+
+       ```
+       TCP GPS Server escuchando en puerto 9000
+       ```
+
+       If it is missing, the Netty server failed to bind. See the "Server crashes on startup" entry below.
+
+    2. Check that port 9000 is reachable from the device's network:
+
+       ```bash
+       # From a host on the same network as the device
+       nc -zv <server-ip> 9000
+       ```
+
+    3. Check firewall rules on the host:
+
+       ```bash
+       # Linux (iptables)
+       sudo iptables -L INPUT -n | grep 9000
+
+       # Linux (ufw)
+       sudo ufw status
+
+       # Allow port 9000 if blocked
+       sudo ufw allow 9000/tcp
+       ```
+
+    4. If running in Docker, confirm both ports are published:
+
+       ```bash
+       docker ps --format 'table {{.Names}}\t{{.Ports}}'
+       ```
+
+       The output should show `0.0.0.0:9000->9000/tcp`.
+  </Accordion>
+
+  <Accordion title="Server receives connection but no data">
+    **Symptoms:** `GPS Conectado` appears in the logs, but no `Protocolo recibido` line follows. The device connects and then goes silent.
+
+    **Checks:**
+
+    1. Confirm the device is configured to use the GT06 protocol. GT06 packets start with the two-byte start marker `0x78 0x78`. The handler discards any byte that does not match this marker:
+
+       ```java
+       if (primerByte != 0x78 || segundoByte != 0x78) {
+           paquete.resetReaderIndex();
+           paquete.readByte(); // skip one byte and retry
+           continue;
+       }
+       ```
+
+    2. If the device is using a different framing (for example, `0x79 0x79` for long packets or a completely different protocol), packets will be silently skipped.
+
+    3. Enable packet capture on the server to inspect raw bytes:
+
+       ```bash
+       sudo tcpdump -i any -X port 9000
+       ```
+
+    4. Verify the device APN, server IP, and server port settings match the deployment environment.
+  </Accordion>
+
+  <Accordion title="CRC mismatch or garbled data">
+    **Symptoms:** `Protocolo recibido` appears but location data is incorrect, or `exceptionCaught` errors appear in the logs.
+
+    ```
+    El error del servidor es: io.netty.handler.codec.DecoderException: ...
+    ```
+
+    **Explanation:** The server reads the CRC bytes from each packet but does not validate them. If the device is sending a different GT06 variant (GT02, GT06N, or a manufacturer-customised firmware) the packet structure may differ from what the handler expects, causing incorrect field offsets.
+
+    **Checks:**
+
+    1. Obtain the exact protocol specification document for your device model. GT06 has multiple revisions and OEM variants.
+
+    2. Enable raw packet logging with `tcpdump` and compare the byte layout against the expected GT06 structure:
+
+       | Offset | Field | Length |
+       |--------|-------|--------|
+       | 0–1 | Start `0x78 0x78` | 2 bytes |
+       | 2 | Packet length | 1 byte |
+       | 3 | Protocol number | 1 byte |
+       | 4 … n-4 | Content | variable |
+       | n-3 … n-2 | CRC | 2 bytes |
+       | n-1 … n | Stop `0x0D 0x0A` | 2 bytes |
+
+    3. If the device uses long packets (`0x79 0x79` start marker with a 2-byte length field), the current handler will not recognise them.
+  </Accordion>
+
+  <Accordion title="Backend forwarding fails (HTTP error)">
+    **Symptoms:** Location data appears correctly in the console but is not reaching the backend service. HTTP errors may appear in the logs.
+
+    **Checks:**
+
+    1. Verify the backend URL in `application.properties`:
+
+       ```properties application.properties
+       backend.base-url=http://localhost:8081
+       ```
+
+       Replace `localhost` with the actual hostname or IP of the backend service. When running inside Docker, `localhost` inside the container refers to the container itself, not the host machine.
+
+    2. If using Docker, use the container name or service name instead:
+
+       ```properties application.properties
+       backend.base-url=http://backend:8081
+       ```
+
+       Or override via environment variable at runtime:
+
+       ```bash
+       docker run -e BACKEND_BASE_URL=http://backend:8081 ...
+       ```
+
+    3. Verify the backend is running and accepting connections:
+
+       ```bash
+       curl -v http://<backend-host>:8081/
+       ```
+
+    4. Check that no firewall rules block outbound HTTP from the ROMP-GPS container to the backend port.
+  </Accordion>
+
+  <Accordion title="IMEI decoding shows wrong value">
+    **Symptoms:** The `IMEI:` log line shows a value that does not match the IMEI printed on the device label.
+
+    **Explanation:** GT06 encodes the IMEI as 8 bytes of Binary Coded Decimal (BCD). Each byte holds two decimal digits (one per nibble). The server decodes this with `GT06Utils.decodificarIMEI(imeiBytes)`.
+
+    Common causes of a mismatch:
+
+    - The device firmware is sending a non-standard IMEI encoding.
+    - The device is sending a different identifier (ICCID or IMSI) in the IMEI field.
+    - The BCD bytes are in a different byte order than expected.
+
+    **Checks:**
+
+    1. Capture the raw login packet and decode the 8 IMEI bytes manually:
+
+       ```
+       Example: bytes 08 60 12 34 56 78 90 12
+       BCD decode:      8  6  0  1  2  3  4  5  6  7  8  9  0  1  2
+       IMEI:            860123456789012
+       ```
+
+    2. Compare the result against the IMEI in your device management portal or the label on the hardware.
+
+    3. If the first BCD nibble is `0x0`, the leading zero is part of the IMEI and should be preserved in the decoded string.
+  </Accordion>
+
+  <Accordion title="Server crashes on startup">
+    **Symptoms:** The application exits immediately after launch. The `TCP GPS Server escuchando en puerto 9000` line does not appear. A `BindException` or `Address already in use` error appears in the logs.
+
+    ```
+    Caused by: java.net.BindException: Address already in use
+    ```
+
+    **Checks:**
+
+    1. Find the process using port 9000:
+
+       ```bash
+       # Linux
+       sudo ss -tlnp | grep 9000
+
+       # macOS
+       lsof -i :9000
+       ```
+
+    2. Find the process using port 8080 (Spring Boot HTTP):
+
+       ```bash
+       sudo ss -tlnp | grep 8080
+       ```
+
+    3. Stop the conflicting process, or change the ROMP-GPS port. To use a different HTTP port:
+
+       ```properties application.properties
+       server.port=8090
+       ```
+
+       The Netty TCP port (9000) is hardcoded in `ServerTcp.java`. Changing it requires modifying the source and rebuilding.
+
+    4. If a previous Docker container is still running on those ports:
+
+       ```bash
+       docker ps -a
+       docker stop romp-gps && docker rm romp-gps
+       ```
+  </Accordion>
+
+  <Accordion title="ACC status always false">
+    **Symptoms:** The `accOn` field in forwarded GPS data is always `false` even when the vehicle ignition is on.
+
+    **Explanation:** The ACC (ignition) status is read from bit 2 (`0x04`) of the `terminalInfo` byte in the heartbeat packet (`0x13`):
+
+    ```java
+    accOn = (terminalInfo & 0x04) != 0;
+    ```
+
+    The heartbeat log shows the raw `Terminal info` byte:
+
+    ```
+    Heartbeat recibido
+    Terminal info: 05
+    Señal GSM: 24
+    ```
+
+    In this example, `0x05` = `0b00000101` — bit 0 and bit 2 are set, so ACC is `true`.
+
+    **Checks:**
+
+    1. Check the `Terminal info` value in the heartbeat log. If bit 2 is not set (e.g., `Terminal info: 01` = `0x01` = `0b00000001`), the device is not reporting ACC on.
+
+    2. Confirm the device firmware is configured to report ACC status in the heartbeat terminal info byte at bit 2. This is standard GT06 behaviour, but some firmware versions use a different bit position.
+
+    3. The `accOn` state is only updated when a heartbeat packet is received. If no heartbeat has arrived yet, `accOn` defaults to `false`.
+
+    4. Some devices only send heartbeats at a low frequency (e.g., every 60 seconds). Verify the heartbeat interval in the device configuration.
+  </Accordion>
+</AccordionGroup>
